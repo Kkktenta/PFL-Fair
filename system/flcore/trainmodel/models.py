@@ -514,6 +514,57 @@ class TextCNN(nn.Module):
 
 # ====================================================================================================================
 
+# Adult Dataset MLP Model for Fairness-aware Federated Learning
+class AdultMLP(nn.Module):
+    def __init__(self, input_dim=14, hidden_dims=[128, 64, 32], num_classes=2, dropout=0.3):
+        """
+        MLP model for Adult dataset classification
+        
+        Args:
+            input_dim: Input feature dimension (14 for Adult dataset after preprocessing)
+            hidden_dims: List of hidden layer dimensions
+            num_classes: Number of output classes (2 for binary income classification)
+            dropout: Dropout rate for regularization
+        """
+        super(AdultMLP, self).__init__()
+        
+        layers = []
+        prev_dim = input_dim
+        
+        # Build hidden layers
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+            layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.ReLU(inplace=True))
+            layers.append(nn.Dropout(dropout))
+            prev_dim = hidden_dim
+        
+        self.encoder = nn.Sequential(*layers)
+        
+        # Final classification layer
+        self.fc = nn.Linear(prev_dim, num_classes)
+    
+    def forward(self, x):
+        # Flatten input if needed
+        if x.ndim > 2:
+            x = torch.flatten(x, 1)
+        
+        # Extract features
+        out = self.encoder(x)
+        
+        # Classification
+        out = self.fc(out)
+        
+        return out
+    
+    def get_embedding(self, x):
+        """Get feature embeddings (useful for fairness analysis)"""
+        if x.ndim > 2:
+            x = torch.flatten(x, 1)
+        return self.encoder(x)
+
+# ====================================================================================================================
+
 
 # class linear(Function):
 #   @staticmethod

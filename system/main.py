@@ -52,7 +52,6 @@ from flcore.servers.servercross import FedCross
 
 # Fairness-aware algorithms
 from flcore.servers.serverfairfed import FairFed
-from flcore.servers.serveralafair import FedALAFair
 
 from flcore.trainmodel.models import *
 
@@ -448,9 +447,6 @@ def run(args):
 
         elif args.algorithm == "FairFed":
             server = FairFed(args, i)
-
-        elif args.algorithm == "FedALAFair":
-            server = FedALAFair(args, i)
 
         else:
             raise NotImplementedError

@@ -1,4 +1,3 @@
-import copy
 import torch
 import numpy as np
 import time
@@ -6,17 +5,149 @@ from flcore.clients.clientbase import Client
 
 
 class clientFairFed(Client):
+    """
+    FairFed client implementing Algorithm 1 (tracking EOD).
+
+    State variables:
+      local_tpr_a0, local_tpr_a1 : Pr(Ŷ=1 | A=0/1, Y=1, C=k)  — for Formula (7)
+      local_acc                   : local accuracy on training data
+      local_F_k                   : local EOD contribution term m_{global,k}
+                                    (None if no positive samples for one group)
+      delta_k                     : Δ_k computed in Step 2
+      adjusted_weight             : ω̄_k^t set by server in Step 3
+    """
+
     def __init__(self, args, id, train_samples, test_samples, **kwargs):
         super().__init__(args, id, train_samples, test_samples, **kwargs)
-        
-        # Fairness parameters
-        self.fairness_lambda = args.fairness_lambda if hasattr(args, 'fairness_lambda') else 0.1
-        self.sensitive_attr_idx = args.sensitive_attr_idx if hasattr(args, 'sensitive_attr_idx') else -1
-        
+
+        self.sensitive_attr_idx = getattr(args, "sensitive_attr_idx", -1)
+
+        # per-round state
+        self.local_tpr_a0 = None  # Pr(Ŷ=1 | A=0, Y=1, C=k)
+        self.local_tpr_a1 = None  # Pr(Ŷ=1 | A=1, Y=1, C=k)
+        self.n_a0_y1 = 0  # local count of (A=0, Y=1) samples
+        self.n_a1_y1 = 0  # local count of (A=1, Y=1) samples
+        self.local_acc = 0.0
+        self.local_F_k = None  # None means F_k undefined for this client
+        self.delta_k = 0.0
+        self.adjusted_weight = None  # ω̄_k^t
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Dataset statistics helper (Algorithm 1, line 2: SecAgg of S)
+    # 仅统计样本数量，不运行模型推理。用于服务器初始化阶段聚合全局
+    # Pr(A=0,Y=1) 和 Pr(A=1,Y=1)，避免对随机初始化模型的无效评估。
+    # ─────────────────────────────────────────────────────────────────────────
+    def get_dataset_stats(self):
+        """返回 { n, n_a0_y1, n_a1_y1 }，纯样本计数，不依赖模型输出。"""
+        trainloader = self.load_train_data()
+        n = 0
+        n_a0_y1 = 0
+        n_a1_y1 = 0
+        with torch.no_grad():
+            for x, y in trainloader:
+                x = x[0].to(self.device) if isinstance(x, list) else x.to(self.device)
+                y = y.to(self.device)
+                n += y.shape[0]
+                if self.sensitive_attr_idx >= 0 and x.ndim == 2:
+                    a = (x[:, self.sensitive_attr_idx] >= 0).long()
+                    pos = y == 1
+                    n_a0_y1 += ((~a.bool()) & pos).sum().item()
+                    n_a1_y1 += ((a.bool()) & pos).sum().item()
+        return {"n": n, "n_a0_y1": n_a0_y1, "n_a1_y1": n_a1_y1}
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Step 1 — ClientLocalMetrics(k, θ^{t-1})
+    # Evaluate the *received global model* on local training data.
+    # Returns the quantities needed by the server to compute F_global (Formula 7)
+    # and Acc_global, together with local sample counts.
+    #
+    # Returned dict (one row of the SecAgg table):
+    #   {
+    #     "n"          : total local training samples,
+    #     "correct"    : number of correctly classified samples,
+    #     "tpr_a0"     : Pr(Ŷ=1 | A=0, Y=1, C=k)  — numerator term,
+    #     "tpr_a1"     : Pr(Ŷ=1 | A=1, Y=1, C=k),
+    #     "n_a0_y1"    : count of (A=0, Y=1) in this client,
+    #     "n_a1_y1"    : count of (A=1, Y=1) in this client,
+    #   }
+    # ─────────────────────────────────────────────────────────────────────────
+    def compute_local_metrics(self):
+        trainloader = self.load_train_data()
+        self.model.eval()
+
+        correct = 0
+        total = 0
+        tp_a0 = 0  # true-positive count for A=0
+        tp_a1 = 0
+        cnt_a0_y1 = 0
+        cnt_a1_y1 = 0
+
+        with torch.no_grad():
+            for x, y in trainloader:
+                x = x[0].to(self.device) if isinstance(x, list) else x.to(self.device)
+                y = y.to(self.device)
+                preds = torch.argmax(self.model(x), dim=1)
+
+                correct += (preds == y).sum().item()
+                total += y.shape[0]
+
+                if self.sensitive_attr_idx >= 0 and x.ndim == 2:
+                    # Binarise sensitive attribute: A=1 if feature >= 0, else A=0
+                    a = (x[:, self.sensitive_attr_idx] >= 0).long()
+                    pos = y == 1
+
+                    mask_a0_y1 = (~a.bool()) & pos
+                    mask_a1_y1 = (a.bool()) & pos
+
+                    tp_a0 += (preds[mask_a0_y1] == 1).sum().item()
+                    tp_a1 += (preds[mask_a1_y1] == 1).sum().item()
+                    cnt_a0_y1 += mask_a0_y1.sum().item()
+                    cnt_a1_y1 += mask_a1_y1.sum().item()
+
+        self.local_acc = correct / total if total > 0 else 0.0
+        self.n_a0_y1 = cnt_a0_y1
+        self.n_a1_y1 = cnt_a1_y1
+
+        # Pr(Ŷ=1 | A=0/1, Y=1, C=k) — set to None if no samples in that group
+        self.local_tpr_a0 = tp_a0 / cnt_a0_y1 if cnt_a0_y1 > 0 else None
+        self.local_tpr_a1 = tp_a1 / cnt_a1_y1 if cnt_a1_y1 > 0 else None
+
+        return {
+            "n": total,
+            "correct": correct,
+            "tpr_a0": self.local_tpr_a0,
+            "tpr_a1": self.local_tpr_a1,
+            "n_a0_y1": cnt_a0_y1,
+            "n_a1_y1": cnt_a1_y1,
+        }
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Step 2 — ClientMetricGap(k, θ^{t-1}, F_global, Acc_global)
+    #
+    # Server broadcasts F_global and Acc_global; client computes:
+    #
+    #   F_k = local EOD = Pr(Ŷ=1|A=0,Y=1,C=k) − Pr(Ŷ=1|A=1,Y=1,C=k)
+    #         (undefined if either TPR is None)
+    #
+    #   Δ_k = |Acc_k − Acc_global|               if F_k is undefined
+    #         |F_global − F_k|                    otherwise
+    #   (Formula 6 piecewise definition)
+    #
+    # Returns Δ_k so the server can compute mean_Δ = (1/K) Σ Δ_i.
+    # ─────────────────────────────────────────────────────────────────────────
+    def compute_metric_gap(self, f_global, acc_global):
+        if self.local_tpr_a0 is None or self.local_tpr_a1 is None:
+            # F_k undefined — use accuracy gap as fallback
+            self.local_F_k = None
+            self.delta_k = abs(self.local_acc - acc_global)
+        else:
+            self.local_F_k = self.local_tpr_a0 - self.local_tpr_a1
+            self.delta_k = abs(f_global - self.local_F_k)
+        return self.delta_k
+
     def train(self):
         trainloader = self.load_train_data()
         self.model.train()
-        
         start_time = time.time()
 
         max_local_epochs = self.local_epochs
@@ -25,134 +156,58 @@ class clientFairFed(Client):
 
         for epoch in range(max_local_epochs):
             for i, (x, y) in enumerate(trainloader):
-                if type(x) == type([]):
-                    x[0] = x[0].to(self.device)
-                else:
-                    x = x.to(self.device)
+                x = x[0].to(self.device) if isinstance(x, list) else x.to(self.device)
                 y = y.to(self.device)
-                
+
                 if self.train_slow:
                     time.sleep(0.1 * np.abs(np.random.rand()))
-                
+
                 output = self.model(x)
-                
-                # Standard classification loss
-                classification_loss = self.loss(output, y)
-                
-                # Fairness loss (Demographic Parity approximation)
-                fairness_loss = self.compute_fairness_loss(x, output, y)
-                
-                # Total loss
-                total_loss = classification_loss + self.fairness_lambda * fairness_loss
-                
+                loss = self.loss(output, y)  # standard ERM — no fairness penalty
                 self.optimizer.zero_grad()
-                total_loss.backward()
+                loss.backward()
                 self.optimizer.step()
 
         if self.learning_rate_decay:
             self.learning_rate_scheduler.step()
+        self.train_time_cost["num_rounds"] += 1
+        self.train_time_cost["total_cost"] += time.time() - start_time
 
-        self.train_time_cost['num_rounds'] += 1
-        self.train_time_cost['total_cost'] += time.time() - start_time
-    
-    def compute_fairness_loss(self, x, output, y):
-        """
-        Compute fairness loss based on Demographic Parity
-        Goal: P(Y_hat=1|S=0) ≈ P(Y_hat=1|S=1)
-        where S is the sensitive attribute (e.g., gender)
-        """
-        try:
-            # Get predictions
-            predictions = torch.softmax(output, dim=1)[:, 1]  # Probability of positive class
-            
-            # For Adult dataset, we need to extract sensitive attribute
-            # If sensitive attribute is not directly available in input,
-            # we approximate fairness by ensuring balanced predictions
-            
-            # Simple approximation: minimize variance in prediction distribution
-            # More sophisticated: use group-specific losses if sensitive attribute is available
-            
-            # Method 1: Variance-based fairness (encourages similar prediction distributions)
-            mean_pred = predictions.mean()
-            fairness_loss = torch.var(predictions)
-            
-            # Method 2: If we have access to sensitive attributes (uncomment if available)
-            # This assumes sensitive attribute is the last feature or at a specific index
-            # if self.sensitive_attr_idx >= 0 and x.ndim == 2:
-            #     sensitive_attr = x[:, self.sensitive_attr_idx]
-            #     # Group predictions by sensitive attribute
-            #     group_0_mask = (sensitive_attr < 0.5)  # Assuming binary and normalized
-            #     group_1_mask = (sensitive_attr >= 0.5)
-            #     
-            #     if group_0_mask.sum() > 0 and group_1_mask.sum() > 0:
-            #         pred_group_0 = predictions[group_0_mask].mean()
-            #         pred_group_1 = predictions[group_1_mask].mean()
-            #         fairness_loss = torch.abs(pred_group_0 - pred_group_1)
-            
-            return fairness_loss
-            
-        except Exception as e:
-            # If fairness computation fails, return zero loss
-            return torch.tensor(0.0, device=output.device)
-    
+    # ─────────────────────────────────────────────────────────────────────────
+    # Evaluation helper used by server's evaluate_with_fairness()
+    # Returns (correct, total, 0, {"eod": value}) on the test split.
+    # ─────────────────────────────────────────────────────────────────────────
     def test_metrics_fairness(self):
-        """
-        Compute test metrics including fairness metrics
-        """
         testloader = self.load_test_data()
         self.model.eval()
+        correct, total = 0, 0
+        all_preds, all_labels, all_sensitive = [], [], []
 
-        test_acc = 0
-        test_num = 0
-        
-        # Fairness metrics
-        all_predictions = []
-        all_labels = []
-        all_sensitive = []
-        
         with torch.no_grad():
             for x, y in testloader:
-                if type(x) == type([]):
-                    x[0] = x[0].to(self.device)
-                else:
-                    x = x.to(self.device)
+                x = x[0].to(self.device) if isinstance(x, list) else x.to(self.device)
                 y = y.to(self.device)
-                
-                output = self.model(x)
-                
-                test_acc += (torch.sum(torch.argmax(output, dim=1) == y)).item()
-                test_num += y.shape[0]
-                
-                # Store for fairness computation
-                predictions = torch.argmax(output, dim=1)
-                all_predictions.append(predictions.cpu().numpy())
+                preds = torch.argmax(self.model(x), dim=1)
+                correct += (preds == y).sum().item()
+                total += y.shape[0]
+                all_preds.append(preds.cpu().numpy())
                 all_labels.append(y.cpu().numpy())
-                
-                # Extract sensitive attribute if available
                 if self.sensitive_attr_idx >= 0 and x.ndim == 2:
-                    sensitive = x[:, self.sensitive_attr_idx]
-                    all_sensitive.append(sensitive.cpu().numpy())
+                    all_sensitive.append(x[:, self.sensitive_attr_idx].cpu().numpy())
 
-        accuracy = test_acc / test_num
-        
-        # Compute fairness metrics if sensitive attributes available
         fairness_metrics = {}
-        if len(all_sensitive) > 0:
-            all_predictions = np.concatenate(all_predictions)
-            all_labels = np.concatenate(all_labels)
-            all_sensitive = np.concatenate(all_sensitive)
-            
-            # Demographic Parity Difference
-            group_0_mask = all_sensitive < 0.5
-            group_1_mask = all_sensitive >= 0.5
-            
-            if group_0_mask.sum() > 0 and group_1_mask.sum() > 0:
-                positive_rate_group_0 = (all_predictions[group_0_mask] == 1).mean()
-                positive_rate_group_1 = (all_predictions[group_1_mask] == 1).mean()
-                demographic_parity = abs(positive_rate_group_0 - positive_rate_group_1)
-                
-                fairness_metrics['demographic_parity'] = demographic_parity
-                fairness_metrics['positive_rate_group_0'] = positive_rate_group_0
-                fairness_metrics['positive_rate_group_1'] = positive_rate_group_1
-        
-        return test_acc, test_num, 0, fairness_metrics
+        if all_sensitive:
+            from fairlearn.metrics import equalized_odds_difference
+
+            try:
+                sensitive = (np.concatenate(all_sensitive) >= 0).astype(int)
+                eod = equalized_odds_difference(
+                    np.concatenate(all_labels),
+                    np.concatenate(all_preds),
+                    sensitive_features=sensitive,
+                )
+                fairness_metrics["eod"] = abs(eod)
+            except Exception:
+                fairness_metrics["eod"] = 0.0
+
+        return correct, total, 0, fairness_metrics

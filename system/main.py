@@ -136,17 +136,6 @@ def run(args):
             else:
                 args.model = DNN(60, 20, num_classes=args.num_classes).to(args.device)
 
-        elif model_str == "AdultMLP":
-            # Specialized MLP for Adult dataset
-            from flcore.trainmodel.models import AdultMLP
-
-            args.model = AdultMLP(
-                input_dim=14,
-                hidden_dims=[128, 64, 32],
-                num_classes=args.num_classes,
-                dropout=0.3,
-            ).to(args.device)
-
         elif model_str == "ResNet18":
             args.model = torchvision.models.resnet18(
                 pretrained=False, num_classes=args.num_classes

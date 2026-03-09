@@ -1,6 +1,8 @@
 import time
 import random
 import numpy as np
+import h5py
+import os
 from flcore.clients.clientfairfed import clientFairFed
 from flcore.servers.serverbase import Server
 
@@ -50,7 +52,10 @@ class FairFed(Server):
         print("Finished creating server and clients.")
 
         self.Budget = []
-        self.fairness_history = {"eod": [], "average_accuracy": []}
+        self.rs_eod = []
+        self.rs_acc_gap = []
+        self.rs_acc_std = []
+        self.rs_acc_worst = []
 
         # ── Initialize ω_k^0 = n_k / Σ n_i  (Algorithm 1, line 1) ──────────
         # omega_bar: 未归一化权重 ω̄_k，是 Formula (6) 更新规则的操作对象
@@ -123,7 +128,7 @@ class FairFed(Server):
                     f"F_global (EOD): {f_global:.4f} | Acc_global: {acc_global:.4f} | mean_Δ: {mean_delta:.4f}"
                 )
                 print("\nEvaluate global model with fairness metrics")
-                self.evaluate_with_fairness()
+                self.evaluate()
 
             # ── Step 3: ClientWeightedModelUpdate ────────────────────────────
             # Formula (6): ω̄_k^t = ω̄_k^{t-1} − β·(Δ_k − (1/K)·Σ_i Δ_i)，截断至 ≥ 0
@@ -164,14 +169,6 @@ class FairFed(Server):
         print(max(self.rs_test_acc))
         print("\nAverage time cost per round.")
         print(sum(self.Budget[1:]) / len(self.Budget[1:]))
-
-        print("\n" + "=" * 50)
-        print("Fairness Summary")
-        print("=" * 50)
-        if self.fairness_history["eod"]:
-            avg_eod = np.mean(self.fairness_history["eod"])
-            print(f"Average Equalized Odds Difference (EOD): {avg_eod:.4f}")
-            print(f"Final EOD: {self.fairness_history['eod'][-1]:.4f}")
 
         self.save_results()
         self.save_global_model()
@@ -268,53 +265,85 @@ class FairFed(Server):
             self.uploaded_weights[idx] /= total_w if total_w > 0 else 1.0
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Evaluate: test accuracy + weighted-average EOD
+    # Evaluate: 复用 serverbase.evaluate() 处理 acc/loss，再附加公平性指标
     # ─────────────────────────────────────────────────────────────────────────
-    def evaluate_with_fairness(self):
-        stats = self.test_metrics()
-        stats_train = self.train_metrics()
+    def evaluate(self, acc=None, loss=None):
+        super().evaluate(acc, loss)
+        self._evaluate_fairness()
 
-        test_acc = sum(stats[2]) / sum(stats[1])
-        train_loss = sum(stats_train[2]) / sum(stats_train[1])
-
-        self.rs_test_acc.append(test_acc)
-        self.rs_train_loss.append(train_loss)
-
-        all_fairness = stats[4] if len(stats) > 4 else []
-        if all_fairness:
-            total_n = sum(stats[1])
-            weighted_eod, n_valid = 0.0, 0
-            for idx, m in enumerate(all_fairness):
-                if isinstance(m, dict) and "eod" in m:
-                    weighted_eod += m["eod"] * stats[1][idx] / total_n
-                    n_valid += 1
-            if n_valid > 0:
-                self.fairness_history["eod"].append(weighted_eod)
-                self.fairness_history["average_accuracy"].append(test_acc)
-                print(
-                    f"Test Acc: {test_acc:.4f} | Train Loss: {train_loss:.4f} | EOD: {weighted_eod:.4f}"
-                )
-                return
-
-        print(f"Test Acc: {test_acc:.4f} | Train Loss: {train_loss:.4f}")
-        print("Fairness metrics not available (configure --sensitive_attr_idx)")
-
-    def test_metrics(self):
-        if self.eval_new_clients and self.num_new_clients > 0:
-            return self.test_metrics_new_clients()
-
-        num_samples, tot_correct, tot_auc, fairness_list = [], [], [], []
+    def _evaluate_fairness(self):
+        stats = []
         for c in self.clients:
-            ct, ns, auc, fm = c.test_metrics_fairness()
-            tot_correct.append(float(ct))
-            num_samples.append(ns)
-            tot_auc.append(auc * ns)
-            fairness_list.append(fm)
+            correct, total, _, fm = c.test_metrics_fairness()
+            if total > 0:
+                stats.append({"correct": correct, "total": total, **fm})
 
-        return (
-            [c.id for c in self.clients],
-            num_samples,
-            tot_correct,
-            tot_auc,
-            fairness_list,
+        if not stats:
+            for lst in [
+                self.rs_eod,
+                self.rs_acc_gap,
+                self.rs_acc_std,
+                self.rs_acc_worst,
+            ]:
+                lst.append(float("nan"))
+            return
+
+        total_samples = sum(s["total"] for s in stats)
+
+        # EOD: 全局聚合 TP/正类 计数后计算 TPR 差（论文公式 2）
+        # 不能按客户端 total 加权 per-client EOD——无正类的大客户端（eod=0）
+        # 权重大，会把整体 EOD 错误地拉向 0。
+        total_tp_g0 = sum(s.get("n_tp_g0", 0) for s in stats)
+        total_y1_g0 = sum(s.get("n_y1_g0", 0) for s in stats)
+        total_tp_g1 = sum(s.get("n_tp_g1", 0) for s in stats)
+        total_y1_g1 = sum(s.get("n_y1_g1", 0) for s in stats)
+        tpr_g0 = total_tp_g0 / total_y1_g0 if total_y1_g0 > 0 else 0.0
+        tpr_g1 = total_tp_g1 / total_y1_g1 if total_y1_g1 > 0 else 0.0
+        weighted_eod = abs(tpr_g0 - tpr_g1)
+
+        # AccGap: aggregate per-group counts then compute group-level accuracy
+        total_g0_correct = sum(s.get("n_correct_g0", 0) for s in stats)
+        total_g0 = sum(s.get("n_g0", 0) for s in stats)
+        total_g1_correct = sum(s.get("n_correct_g1", 0) for s in stats)
+        total_g1 = sum(s.get("n_g1", 0) for s in stats)
+        acc_g0 = total_g0_correct / total_g0 if total_g0 > 0 else float("nan")
+        acc_g1 = total_g1_correct / total_g1 if total_g1 > 0 else float("nan")
+        acc_gap = (
+            abs(acc_g0 - acc_g1)
+            if not (np.isnan(acc_g0) or np.isnan(acc_g1))
+            else float("nan")
         )
+
+        # AccStd, AccWorst (10th percentile) across clients
+        per_client_accs = [s["correct"] / s["total"] for s in stats]
+        acc_std = float(np.std(per_client_accs))
+        acc_worst = float(np.percentile(per_client_accs, 10))
+
+        self.rs_eod.append(weighted_eod)
+        self.rs_acc_gap.append(acc_gap)
+        self.rs_acc_std.append(acc_std)
+        self.rs_acc_worst.append(acc_worst)
+
+        print(
+            f"  [Fairness] EOD: {weighted_eod:.4f} | AccGap: {acc_gap:.4f} | "
+            f"AccStd: {acc_std:.4f} | AccWorst(p10): {acc_worst:.4f}"
+        )
+
+    def save_results(self):
+        algo = self.dataset + "_" + self.algorithm
+        result_path = "../results/"
+        os.makedirs(result_path, exist_ok=True)
+
+        if len(self.rs_test_acc):
+            algo = algo + "_" + self.goal + "_" + str(self.times)
+            file_path = result_path + "{}.h5".format(algo)
+            print("File path: " + file_path)
+
+            with h5py.File(file_path, "w") as hf:
+                hf.create_dataset("rs_test_acc", data=self.rs_test_acc)
+                hf.create_dataset("rs_test_auc", data=self.rs_test_auc)
+                hf.create_dataset("rs_train_loss", data=self.rs_train_loss)
+                hf.create_dataset("rs_eod", data=self.rs_eod)
+                hf.create_dataset("rs_acc_gap", data=self.rs_acc_gap)
+                hf.create_dataset("rs_acc_std", data=self.rs_acc_std)
+                hf.create_dataset("rs_acc_worst", data=self.rs_acc_worst)

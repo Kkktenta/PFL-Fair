@@ -10,6 +10,7 @@ import torchvision
 import logging
 
 from flcore.servers.serveravg import FedAvg
+from flcore.servers.serveravg_fair import FedAvg_Fair
 from flcore.servers.serverpFedMe import pFedMe
 from flcore.servers.serverperavg import PerAvg
 from flcore.servers.serverprox import FedProx
@@ -33,6 +34,7 @@ from flcore.servers.servergen import FedGen
 from flcore.servers.serverscaffold import SCAFFOLD
 from flcore.servers.serverfd import FD
 from flcore.servers.serverala import FedALA
+from flcore.servers.serverala_fair import FedALA_Fair
 from flcore.servers.serverpac import FedPAC
 from flcore.servers.serverlg import LG_FedAvg
 from flcore.servers.servergc import FedGC
@@ -52,6 +54,7 @@ from flcore.servers.servercross import FedCross
 
 # Fairness-aware algorithms
 from flcore.servers.serverfairfed import FairFed
+from flcore.servers.serverpflfair import PFLFair
 
 from flcore.trainmodel.models import *
 
@@ -352,6 +355,9 @@ def run(args):
         elif args.algorithm == "FedALA":
             server = FedALA(args, i)
 
+        elif args.algorithm == "FedALA_Fair":
+            server = FedALA_Fair(args, i)
+
         elif args.algorithm == "FedPAC":
             args.head = copy.deepcopy(args.model.fc)
             args.model.fc = nn.Identity()
@@ -436,6 +442,15 @@ def run(args):
 
         elif args.algorithm == "FairFed":
             server = FairFed(args, i)
+
+        elif args.algorithm == "PFL-Fair":
+            server = PFLFair(args, i)
+
+        elif args.algorithm == "FedAvg_Fair":
+            args.head = copy.deepcopy(args.model.fc)
+            args.model.fc = nn.Identity()
+            args.model = BaseHeadSplit(args.model, args.head)
+            server = FedAvg_Fair(args, i)
 
         else:
             raise NotImplementedError

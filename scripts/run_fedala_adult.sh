@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# 用 Adult 数据集跑 FedAvg 实验
-# 运行方式：在项目根目录执行  bash run_fedavg_adult.sh
+# 用 Adult 数据集跑 FedALA 实验
+# 运行方式：bash scripts/run_fedala_adult.sh
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR/system"
+cd "$SCRIPT_DIR/../system"
 
 # ── 设备检测 ──────────────────────────────────────────────────────────────────
-if python -c "import torch; exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+if python3 -c "import torch; exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
     DEVICE="cuda"
     DEVICE_ID="0"
 else
@@ -28,13 +28,19 @@ LOCAL_EPOCHS=5
 BATCH_SIZE=32
 LR=0.001
 JOIN_RATIO=1.0
+SENSITIVE_ATTR_IDX=12  # Adult 数据集 sex 列索引，用于公平性评估
 
-python main.py \
+# ── FedALA 专属参数 ───────────────────────────────────────────────────────────
+ETA=1.0          # 自适应本地聚合的学习率缩放因子
+RAND_PERCENT=80  # 用于 ALA 随机采样的百分比
+LAYER_IDX=2      # 参与自适应聚合的层编号（从输出层往前数）
+
+python3 main.py \
     -data  "$DATASET"       \
     -nc    "$NUM_CLIENTS"   \
     -ncl   "$NUM_CLASSES"   \
     -m     "$MODEL"         \
-    -algo  "FedAvg"         \
+    -algo  "FedALA_Fair"    \
     -gr    "$GLOBAL_ROUNDS" \
     -ls    "$LOCAL_EPOCHS"  \
     -lbs   "$BATCH_SIZE"    \
@@ -42,6 +48,10 @@ python main.py \
     -jr    "$JOIN_RATIO"    \
     -dev   "$DEVICE"        \
     -did   "$DEVICE_ID"     \
+    -sai   "$SENSITIVE_ATTR_IDX" \
+    -et    "$ETA"           \
+    -s     "$RAND_PERCENT"  \
+    -p     "$LAYER_IDX"     \
     -eg    5                \
     -t     1                \
-    -go    "fedavg_adult_run1"
+    -go    "fedala_fair_adult_run1"

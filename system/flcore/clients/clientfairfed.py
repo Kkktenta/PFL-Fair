@@ -173,41 +173,6 @@ class clientFairFed(Client):
         self.train_time_cost["num_rounds"] += 1
         self.train_time_cost["total_cost"] += time.time() - start_time
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # Evaluation helper used by server's evaluate_with_fairness()
-    # Returns (correct, total, 0, {"eod": value}) on the test split.
-    # ─────────────────────────────────────────────────────────────────────────
-    def test_metrics_fairness(self):
-        testloader = self.load_test_data()
-        self.model.eval()
-        correct, total = 0, 0
-        all_preds, all_labels, all_sensitive = [], [], []
-
-        with torch.no_grad():
-            for x, y in testloader:
-                x = x[0].to(self.device) if isinstance(x, list) else x.to(self.device)
-                y = y.to(self.device)
-                preds = torch.argmax(self.model(x), dim=1)
-                correct += (preds == y).sum().item()
-                total += y.shape[0]
-                all_preds.append(preds.cpu().numpy())
-                all_labels.append(y.cpu().numpy())
-                if self.sensitive_attr_idx >= 0 and x.ndim == 2:
-                    all_sensitive.append(x[:, self.sensitive_attr_idx].cpu().numpy())
-
-        fairness_metrics = {}
-        if all_sensitive:
-            from fairlearn.metrics import equalized_odds_difference
-
-            try:
-                sensitive = (np.concatenate(all_sensitive) >= 0).astype(int)
-                eod = equalized_odds_difference(
-                    np.concatenate(all_labels),
-                    np.concatenate(all_preds),
-                    sensitive_features=sensitive,
-                )
-                fairness_metrics["eod"] = abs(eod)
-            except Exception:
-                fairness_metrics["eod"] = 0.0
-
-        return correct, total, 0, fairness_metrics
+    # test_metrics_fairness() 由 clientbase.Client 提供，返回完整的
+    # (correct, total, 0, {"eod", "n_correct_g0", "n_g0", "n_correct_g1", "n_g1"})
+    # 此处不再覆写，保持与 FedAvg_Fair / FedALA_Fair / PFL-Fair 的评估逻辑一致。

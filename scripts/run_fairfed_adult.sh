@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
 # 用 Adult 数据集跑 FairFed 实验
-# 运行方式：在项目根目录执行  bash run_fairfed_adult.sh
+# 运行方式：bash scripts/run_fairfed_adult.sh
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR/system"
+cd "$SCRIPT_DIR/../system"
 
 # ── 设备检测 ──────────────────────────────────────────────────────────────────
-if python -c "import torch; exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+if python3 -c "import torch; exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
     DEVICE="cuda"
     DEVICE_ID="0"
 else
@@ -33,7 +33,7 @@ JOIN_RATIO=1.0      # 全部客户端参与
 FAIRNESS_LAMBDA=0.1   # β：公平性权重调整步长
 SENSITIVE_ATTR_IDX=12 # Adult 数据集 sex 列在特征矩阵中的索引
 
-python main.py \
+python3 main.py \
     -data  "$DATASET"           \
     -nc    "$NUM_CLIENTS"       \
     -ncl   "$NUM_CLASSES"       \

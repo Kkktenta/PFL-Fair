@@ -165,15 +165,18 @@ class Client(object):
         # 避免在单个客户端上做加权平均（无正类的大客户端会把 EOD 错误地拉向 0）。
         mask_y1_g0 = (sensitive_arr == 0) & (labels_arr == 1)
         mask_y1_g1 = (sensitive_arr == 1) & (labels_arr == 1)
+        # 显式比较 == 1（正类），而非 .sum()，确保 num_classes > 2 时也正确
         fairness_metrics["n_tp_g0"] = (
-            int(preds_arr[mask_y1_g0].sum()) if mask_y1_g0.any() else 0
+            int((preds_arr[mask_y1_g0] == 1).sum()) if mask_y1_g0.any() else 0
         )
         fairness_metrics["n_y1_g0"] = int(mask_y1_g0.sum())
         fairness_metrics["n_tp_g1"] = (
-            int(preds_arr[mask_y1_g1].sum()) if mask_y1_g1.any() else 0
+            int((preds_arr[mask_y1_g1] == 1).sum()) if mask_y1_g1.any() else 0
         )
         fairness_metrics["n_y1_g1"] = int(mask_y1_g1.sum())
         # 保留单客户端 EOD 供调试参考（服务端不用此字段计算全局 EOD）
+        # 注意：EOD 带符号，不取绝对值，与论文公式 (2) 一致：
+        #   EOD = Pr(Ŷ=1|A=0,Y=1) - Pr(Ŷ=1|A=1,Y=1)
         tpr_g0 = (
             fairness_metrics["n_tp_g0"] / fairness_metrics["n_y1_g0"]
             if fairness_metrics["n_y1_g0"] > 0
@@ -184,7 +187,7 @@ class Client(object):
             if fairness_metrics["n_y1_g1"] > 0
             else 0.0
         )
-        fairness_metrics["eod"] = abs(tpr_g0 - tpr_g1)
+        fairness_metrics["eod"] = tpr_g0 - tpr_g1
 
         mask_g0 = sensitive_arr == 0
         mask_g1 = sensitive_arr == 1

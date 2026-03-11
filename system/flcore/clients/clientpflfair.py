@@ -44,3 +44,31 @@ class clientPFLFair(clientFairFed):
     def local_initialization(self, received_global_model):
         """ALA：在公平全局模型与本地模型之间自适应聚合，代替直接参数覆盖。"""
         self.ALA.adaptive_local_aggregation(received_global_model, self.model)
+
+    def train(self):
+        """
+        在 FairFed 的本地 SGD 训练之前先执行 ALA 自适应聚合。
+
+        正确流程：
+          1. serverpflfair.send_models() 在覆盖本地模型之前已将「上一轮训练完的
+             本地模型」存入 self._local_model_before_ala，并将全局模型引用存入
+             self._global_model_snapshot。
+          2. 此处先将 client.model 恢复为 local_prev，再调用 ALA 混合
+             (global_snapshot, local_prev) → 得到个性化起点。
+          3. 之后调用父类 clientFairFed.train() 从个性化起点做带公平重加权的 SGD。
+
+        关键：ALA 需要 global != local 才能工作；若直接对覆盖后的全局模型做 ALA，
+        两者参数相同 → ALA 内部 sum(diff)==0 → 立即 return → ALA 形同虚设。
+        """
+        local_prev = getattr(self, "_local_model_before_ala", None)
+        snapshot = getattr(self, "_global_model_snapshot", None)
+
+        if local_prev is not None and snapshot is not None:
+            # 恢复上一轮的本地模型作为 ALA 的 local 侧
+            self.set_parameters(local_prev)
+            # ALA 混合：(global_snapshot, local_prev) → self.model
+            self.ALA.adaptive_local_aggregation(snapshot, self.model)
+            self._local_model_before_ala = None
+            self._global_model_snapshot = None
+        # 调用父类（clientFairFed）的带公平重加权 SGD 训练
+        super().train()

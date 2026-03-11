@@ -63,7 +63,28 @@ class PFLFair(FairFed):
         )
 
     def send_models(self):
-        """用 ALA 自适应聚合代替直接参数覆盖，实现个性化适配。"""
+        """
+        PFL-Fair 的 send_models 分两步：
+
+          1. 在覆盖客户端模型之前，先把「上一轮训练完的本地模型」克隆保存。
+             ALA 需要 (global, local_prev) 两个不同的模型来做自适应混合。
+             如果用 set_parameters 覆盖后再做 ALA，两者参数完全相同，
+             ALA 内部 sum(diff)==0 判断会直接 return，等同于没有 ALA。
+
+          2. 再将全局模型参数复制到客户端（供 compute_local_metrics 正确
+             评估纯全局模型的公平性指标，而非被 ALA 偏移后的个性化模型）。
+        """
+        import copy
+        import time as _time
+
         assert len(self.clients) > 0
         for client in self.clients:
-            client.local_initialization(self.global_model)
+            start_time = _time.time()
+            # ① 先保存上一轮训练后的本地模型（ALA 的 local 侧输入）
+            client._local_model_before_ala = copy.deepcopy(client.model)
+            # ② 用全局模型覆盖客户端模型（供 compute_local_metrics 正确评估）
+            client.set_parameters(self.global_model)
+            # ③ 同时保存全局模型引用（ALA 的 global 侧输入），只读不改
+            client._global_model_snapshot = self.global_model
+            client.send_time_cost["num_rounds"] += 1
+            client.send_time_cost["total_cost"] += 2 * (_time.time() - start_time)

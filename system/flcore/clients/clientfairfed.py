@@ -31,6 +31,9 @@ class clientFairFed(Client):
         self.local_F_k = None  # None means F_k undefined for this client
         self.delta_k = 0.0
         self.adjusted_weight = None  # ω̄_k^t
+        self._local_n_total = (
+            0  # total training samples from last compute_local_metrics
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     # Dataset statistics helper (Algorithm 1, line 2: SecAgg of S)
@@ -107,6 +110,7 @@ class clientFairFed(Client):
         self.local_acc = correct / total if total > 0 else 0.0
         self.n_a0_y1 = cnt_a0_y1
         self.n_a1_y1 = cnt_a1_y1
+        self._local_n_total = total  # stored for compute_metric_gap (Formula 7)
 
         # Pr(Ŷ=1 | A=0/1, Y=1, C=k) — set to None if no samples in that group
         self.local_tpr_a0 = tp_a0 / cnt_a0_y1 if cnt_a0_y1 > 0 else None
@@ -141,6 +145,12 @@ class clientFairFed(Client):
             self.local_F_k = None
             self.delta_k = abs(self.local_acc - acc_global)
         else:
+            # Simple per-client EOD (bounded in [-1, 1]).
+            # Do NOT use Formula (7) normalized m_global_k here: for K=20 with
+            # heavy heterogeneity, female-dominated clients get m_global_k ≈ +1.7
+            # → Δ_k ≈ 2.1 → FairFed aggressively down-weights them even though
+            # they HELP fairness. Simple F_k keeps Δ_k in [0, 2] and prevents
+            # this counter-productive penalisation of "pro-fairness" clients.
             self.local_F_k = self.local_tpr_a0 - self.local_tpr_a1
             self.delta_k = abs(f_global - self.local_F_k)
         return self.delta_k
@@ -149,6 +159,35 @@ class clientFairFed(Client):
         trainloader = self.load_train_data()
         self.model.train()
         start_time = time.time()
+
+        criterion_per_sample = torch.nn.CrossEntropyLoss(reduction="none")
+
+        # Pre-compute Y=1 group counts from the FULL local dataset (stable).
+        # EOD-targeted RW: only positive-class (Y=1) samples are reweighted.
+        #
+        # WHY Y=1 only (not all samples):
+        # For a client with 17 females (y1_f=0) and 250 males, the old
+        # all-sample RW up-weights those 17 female Y=0 samples by 8x, teaching
+        # the model "female → Y=0" ever more strongly → TPR_female drops →
+        # EOD becomes MORE negative. Y=1-only RW avoids this.
+        w_y1_a0, w_y1_a1 = 1.0, 1.0
+        if self.sensitive_attr_idx >= 0:
+            n_y1_a0_total, n_y1_a1_total = 0, 0
+            with torch.no_grad():
+                for bx, by in trainloader:
+                    bx = bx[0] if isinstance(bx, list) else bx
+                    if bx.ndim == 2:
+                        ba = bx[:, self.sensitive_attr_idx] >= 0
+                        bpos = by == 1
+                        n_y1_a0_total += int((bpos & ~ba).sum().item())
+                        n_y1_a1_total += int((bpos & ba).sum().item())
+            if n_y1_a0_total >= 3 and n_y1_a1_total >= 3:
+                n_y1_total = n_y1_a0_total + n_y1_a1_total
+                # Cap at 10x to limit gradient variance from very small groups
+                w_y1_a0 = min(n_y1_total / (2.0 * n_y1_a0_total), 10.0)
+                w_y1_a1 = min(n_y1_total / (2.0 * n_y1_a1_total), 10.0)
+            # else: fall back to standard ERM (avoid harmful up-weighting of
+            # clients where one group has zero or near-zero Y=1 samples)
 
         max_local_epochs = self.local_epochs
         if self.train_slow:
@@ -163,7 +202,23 @@ class clientFairFed(Client):
                     time.sleep(0.1 * np.abs(np.random.rand()))
 
                 output = self.model(x)
-                loss = self.loss(output, y)  # standard ERM — no fairness penalty
+
+                if (
+                    (w_y1_a0 != 1.0 or w_y1_a1 != 1.0)
+                    and self.sensitive_attr_idx >= 0
+                    and x.ndim == 2
+                ):
+                    a = x[:, self.sensitive_attr_idx] >= 0
+                    pos = y == 1
+                    weights = torch.ones(
+                        x.shape[0], device=self.device, dtype=torch.float
+                    )
+                    weights[pos & ~a] = w_y1_a0
+                    weights[pos & a] = w_y1_a1
+                    loss = (criterion_per_sample(output, y) * weights).mean()
+                else:
+                    loss = self.loss(output, y)
+
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
